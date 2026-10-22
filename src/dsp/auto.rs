@@ -6,7 +6,8 @@
 //!   become narrow bells.
 //! - [`balance`]: the 1/3-octave spectrum is compared with pink noise (equal
 //!   power per octave); regions above the median level are cut with broad
-//!   bells or shelves, largest excess first.
+//!   bells or shelves, largest excess first, all fitted together so their
+//!   sum follows the excess.
 //!
 //! Both add the response of the bands they do not own (`others`) to the
 //! measured spectrum first, so they see the signal as the rest of the EQ
@@ -39,6 +40,14 @@ const RESONANCE_RANGE: (f64, f64) = (40.0, 16_000.0);
 const MIN_EXCESS: f64 = 1.5;
 /// Deepest cut of one balance band.
 const MAX_BALANCE_CUT: f64 = 6.0;
+/// Balance bands the fit leaves shallower than this are dropped (dB).
+const MIN_BALANCE_CUT: f32 = 0.5;
+/// Q range of the balance bells.
+const BELL_Q: (f64, f64) = (0.3, 4.0);
+/// How much worse cutting too much counts than cutting too little in the
+/// balance fit (on the squared error): balance never boosts, so an overcut
+/// cannot be made up.
+const OVERCUT_WEIGHT: f64 = 4.0;
 /// Range the pink reference level is taken from, and the range balanced.
 const REFERENCE_RANGE: (f64, f64) = (40.0, 12_000.0);
 const BALANCE_RANGE: (f64, f64) = (25.0, 16_000.0);
@@ -358,6 +367,13 @@ pub fn find_resonances(samples: &[f32], sample_rate: f32, others: &[Band]) -> Re
 /// Broad cuts that bring the spectrum of `samples` towards pink noise, at
 /// most [`MAX_BALANCE_BANDS`], largest excess first. Never boosts.
 pub fn balance(samples: &[f32], sample_rate: f32, others: &[Band]) -> Result<Vec<Band>, AutoError> {
+    let (freqs, excess) = balance_excess(samples, sample_rate, others)?;
+    Ok(fit_balance(&freqs, &excess, sample_rate as f64))
+}
+
+/// Analysis points (every 1/12 octave) and the excess over the pink
+/// reference there (dB, ≥ 0): the cut the balance bands should add up to.
+fn balance_excess(samples: &[f32], sample_rate: f32, others: &[Band]) -> Result<(Vec<f64>, Vec<f64>), AutoError> {
     let n = fft_size(sample_rate);
     check(samples, n)?;
     let sr = sample_rate as f64;
@@ -388,45 +404,215 @@ pub fn balance(samples: &[f32], sample_rate: f32, others: &[Band]) -> Result<Vec
         .map(|(_, l)| *l)
         .collect();
     let reference = median(&mut reference);
-    let mut excess: Vec<f64> = level.iter().map(|l| (l - reference).max(0.0)).collect();
+    let excess = level.iter().map(|l| (l - reference).max(0.0)).collect();
+    Ok((freqs, excess))
+}
 
-    let last = freqs.len() - 1;
+/// Broad cuts whose summed response follows `excess` (the cut wanted at each
+/// of `freqs`). Each new band starts where the most excess is left uncut and
+/// is shaped by the half-excess points there; then all bands are fitted
+/// together, so overlapping bands share the cut instead of stacking.
+fn fit_balance(freqs: &[f64], excess: &[f64], sr: f64) -> Vec<Band> {
+    let fit = BalanceFit { freqs, excess, sr };
     let mut bands = Vec::new();
     while bands.len() < MAX_BALANCE_BANDS {
-        let (peak, e) = excess.iter().enumerate().fold((0, 0.0), |m, (i, e)| if *e > m.1 { (i, *e) } else { m });
+        let left: Vec<f64> = fit.misfit(&fit.responses(&bands)).iter().map(|m| m.max(0.0)).collect();
+        let (peak, e) = left.iter().enumerate().fold((0, 0.0), |m, (i, e)| if *e > m.1 { (i, *e) } else { m });
         if e < MIN_EXCESS {
             break;
         }
-        let half = e * 0.5;
-        let mut lo = peak;
-        while lo > 0 && excess[lo - 1] > half {
-            lo -= 1;
-        }
-        let mut hi = peak;
-        while hi < last && excess[hi + 1] > half {
-            hi += 1;
-        }
-        let gain = -e.min(MAX_BALANCE_CUT) as f32;
-        let band = if lo == 0 && freqs[peak] < 200.0 {
-            // Excess down to the bottom: a low shelf with its half-gain
-            // corner where the excess halves.
-            Band { kind: FilterType::LowShelf, freq: freqs[hi] as f32, q: FLAT_Q, ..cut(gain) }
-        } else if hi == last && freqs[peak] > 4000.0 {
-            Band { kind: FilterType::HighShelf, freq: freqs[lo] as f32, q: FLAT_Q, ..cut(gain) }
-        } else {
-            // Width between the half-excess points, as the RBJ bell's
-            // bandwidth (between its half-gain points).
-            let octaves = ((freqs[hi] / freqs[lo]).log2() + 1.0 / 12.0).clamp(0.4, 4.0);
-            let q = 2f64.powf(octaves).sqrt() / (2f64.powf(octaves) - 1.0);
-            Band { kind: FilterType::Bell, freq: freqs[peak] as f32, q: q.clamp(0.3, 4.0) as f32, ..cut(gain) }
-        };
-        let d = design(&band, sr);
-        for (e, f) in excess.iter_mut().zip(&freqs) {
-            *e = (*e + d.response_db(*f, sr)).max(0.0);
-        }
-        bands.push(band);
+        bands.push(seed_band(freqs, &left, peak, e));
+        fit.refine(&mut bands);
     }
-    Ok(bands)
+    // Bands the joint fit made shallow are not worth a slot.
+    let before = bands.len();
+    bands.retain(|b| b.gain <= -MIN_BALANCE_CUT);
+    if bands.len() < before {
+        fit.refine(&mut bands);
+    }
+    bands
+}
+
+/// A band for the uncut excess `left` around its maximum `e` at `peak`.
+fn seed_band(freqs: &[f64], left: &[f64], peak: usize, e: f64) -> Band {
+    let last = freqs.len() - 1;
+    let half = e * 0.5;
+    let mut lo = peak;
+    while lo > 0 && left[lo - 1] > half {
+        lo -= 1;
+    }
+    let mut hi = peak;
+    while hi < last && left[hi + 1] > half {
+        hi += 1;
+    }
+    let gain = -e.min(MAX_BALANCE_CUT) as f32;
+    if lo == 0 && freqs[peak] < 200.0 {
+        // Excess down to the bottom: a low shelf with its half-gain corner
+        // where the excess halves.
+        Band { kind: FilterType::LowShelf, freq: freqs[hi] as f32, q: FLAT_Q, ..cut(gain) }
+    } else if hi == last && freqs[peak] > 4000.0 {
+        Band { kind: FilterType::HighShelf, freq: freqs[lo] as f32, q: FLAT_Q, ..cut(gain) }
+    } else {
+        // Centred in the region, its width between the half-excess points as
+        // the RBJ bell's bandwidth (between its half-gain points).
+        let octaves = ((freqs[hi] / freqs[lo]).log2() + 1.0 / 12.0).clamp(0.4, 4.0);
+        let q = 2f64.powf(octaves).sqrt() / (2f64.powf(octaves) - 1.0);
+        let freq = (freqs[lo] * freqs[hi]).sqrt();
+        Band { kind: FilterType::Bell, freq: freq as f32, q: q.clamp(BELL_Q.0, BELL_Q.1) as f32, ..cut(gain) }
+    }
+}
+
+/// Least-squares fit of the balance bands' summed response to the cut
+/// `excess` asks for (Levenberg-Marquardt on gain, octave frequency and
+/// octave Q; shelves keep Q 0.71 so they do not bump).
+struct BalanceFit<'a> {
+    freqs: &'a [f64],
+    excess: &'a [f64],
+    sr: f64,
+}
+
+impl BalanceFit<'_> {
+    /// Response of each band at each point (dB).
+    fn responses(&self, bands: &[Band]) -> Vec<Vec<f64>> {
+        bands.iter().map(|b| self.response(b)).collect()
+    }
+
+    fn response(&self, band: &Band) -> Vec<f64> {
+        let d = design(band, self.sr);
+        self.freqs.iter().map(|f| d.response_db(*f, self.sr)).collect()
+    }
+
+    /// Excess left after the bands at each point: > 0 cut too little,
+    /// < 0 cut too much.
+    fn misfit(&self, responses: &[Vec<f64>]) -> Vec<f64> {
+        (0..self.freqs.len()).map(|i| self.excess[i] + responses.iter().map(|r| r[i]).sum::<f64>()).collect()
+    }
+
+    fn cost(misfit: &[f64]) -> f64 {
+        misfit.iter().map(|m| m * m * if *m < 0.0 { OVERCUT_WEIGHT } else { 1.0 }).sum()
+    }
+
+    /// Fitted parameter `k` (0 gain dB, 1 octave frequency, 2 octave Q) of
+    /// `band`, and its bounds; None if it stays fixed.
+    fn param(&self, band: &Band, k: usize) -> Option<(f64, f64, f64)> {
+        let (lo, hi) = (self.freqs[0], self.freqs[self.freqs.len() - 1]);
+        match k {
+            0 => Some((band.gain as f64, -MAX_BALANCE_CUT, 0.0)),
+            1 => Some(((band.freq as f64).log2(), lo.log2(), hi.log2())),
+            _ if band.kind == FilterType::Bell => Some(((band.q as f64).log2(), BELL_Q.0.log2(), BELL_Q.1.log2())),
+            _ => None,
+        }
+    }
+
+    fn set_param(band: &mut Band, k: usize, v: f64) {
+        match k {
+            0 => band.gain = v as f32,
+            1 => band.freq = v.exp2() as f32,
+            _ => band.q = v.exp2() as f32,
+        }
+    }
+
+    fn refine(&self, bands: &mut [Band]) {
+        const STEP: f64 = 1e-3;
+        let params: Vec<(usize, usize)> =
+            (0..bands.len()).flat_map(|b| (0..3).map(move |k| (b, k))).filter(|&(b, k)| self.param(&bands[b], k).is_some()).collect();
+        let n = params.len();
+        let mut responses = self.responses(bands);
+        let mut misfit = self.misfit(&responses);
+        let mut cost = Self::cost(&misfit);
+        let mut lambda = 1e-3;
+        for _ in 0..100 {
+            // Weighted normal equations from a forward-difference Jacobian;
+            // only the moved band's response changes per column.
+            let w: Vec<f64> = misfit.iter().map(|m| if *m < 0.0 { OVERCUT_WEIGHT } else { 1.0 }).collect();
+            let jac: Vec<Vec<f64>> = params
+                .iter()
+                .map(|&(b, k)| {
+                    let mut moved = bands[b];
+                    let (v, _, hi) = self.param(&moved, k).unwrap();
+                    let h = if v + STEP > hi { -STEP } else { STEP };
+                    Self::set_param(&mut moved, k, v + h);
+                    self.response(&moved).iter().zip(&responses[b]).map(|(a, r)| (a - r) / h).collect()
+                })
+                .collect();
+            let mut a = vec![vec![0.0; n]; n];
+            let mut g = vec![0.0; n];
+            for p in 0..n {
+                g[p] = (0..misfit.len()).map(|i| jac[p][i] * w[i] * misfit[i]).sum();
+                for q in 0..=p {
+                    a[p][q] = (0..misfit.len()).map(|i| jac[p][i] * w[i] * jac[q][i]).sum();
+                    a[q][p] = a[p][q];
+                }
+            }
+            // Parameters pressed against a bound stay there this round.
+            let free: Vec<bool> = params
+                .iter()
+                .zip(&g)
+                .map(|(&(b, k), g)| {
+                    let (v, lo, hi) = self.param(&bands[b], k).unwrap();
+                    !((v <= lo + 1e-9 && *g > 0.0) || (v >= hi - 1e-9 && *g < 0.0))
+                })
+                .collect();
+            let improved = loop {
+                let mut m: Vec<Vec<f64>> = (0..n)
+                    .map(|p| {
+                        let mut row: Vec<f64> = (0..n).map(|q| if free[p] && free[q] { a[p][q] } else { 0.0 }).collect();
+                        row[p] = if free[p] { a[p][p] * (1.0 + lambda) + 1e-9 } else { 1.0 };
+                        row
+                    })
+                    .collect();
+                let mut rhs: Vec<f64> = (0..n).map(|p| if free[p] { -g[p] } else { 0.0 }).collect();
+                let step = solve(&mut m, &mut rhs);
+                let mut trial = bands.to_vec();
+                for (&(b, k), d) in params.iter().zip(&step) {
+                    let (v, lo, hi) = self.param(&trial[b], k).unwrap();
+                    Self::set_param(&mut trial[b], k, (v + d).clamp(lo, hi));
+                }
+                let r = self.responses(&trial);
+                let m = self.misfit(&r);
+                let c = Self::cost(&m);
+                if c < cost {
+                    let gain = cost - c;
+                    bands.copy_from_slice(&trial);
+                    (responses, misfit, cost) = (r, m, c);
+                    lambda = (lambda / 3.0).max(1e-9);
+                    break gain > 1e-6 * cost.max(1e-3);
+                }
+                lambda *= 4.0;
+                if lambda > 1e8 {
+                    break false;
+                }
+            };
+            if !improved {
+                break;
+            }
+        }
+    }
+}
+
+/// Solves `m x = rhs` by Gaussian elimination with partial pivoting
+/// (overwrites both; `m` is small and regularised, never singular here).
+fn solve(m: &mut [Vec<f64>], rhs: &mut [f64]) -> Vec<f64> {
+    let n = rhs.len();
+    for c in 0..n {
+        let p = (c..n).max_by(|&i, &j| m[i][c].abs().total_cmp(&m[j][c].abs())).unwrap();
+        m.swap(c, p);
+        rhs.swap(c, p);
+        let (top, below) = m.split_at_mut(c + 1);
+        let pivot = &top[c];
+        for (r, row) in below.iter_mut().enumerate() {
+            let f = row[c] / pivot[c];
+            for (v, p) in row[c..].iter_mut().zip(&pivot[c..]) {
+                *v -= f * p;
+            }
+            rhs[c + 1 + r] -= f * rhs[c];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for r in (0..n).rev() {
+        x[r] = (rhs[r] - (r + 1..n).map(|k| m[r][k] * x[k]).sum::<f64>()) / m[r][r];
+    }
+    x
 }
 
 /// Where the bands of an analysis go (see [`plan`]).
@@ -603,6 +789,89 @@ mod tests {
         eprintln!("mode: {:#?}", find_resonances(&x, SR, &[]).unwrap());
     }
 
+    /// Signals with broad deviations from pink, for the balance tests.
+    fn coloured() -> Vec<(&'static str, Vec<f32>)> {
+        let b = |kind, freq, gain, q| Band { on: true, kind, freq, gain, q, ..Band::default() };
+        let through = |x: Vec<f32>, bands: &[Band]| bands.iter().fold(x, |x, band| shaped(&x, *band));
+        vec![
+            ("bass", through(pink_noise(LEN, 11), &[b(FilterType::LowShelf, 200.0, 8.0, FLAT_Q)])),
+            ("dark tilt", through(pink_noise(LEN, 12), &[b(FilterType::TiltShelf, 1000.0, -9.0, FLAT_Q)])),
+            ("bright tilt", through(pink_noise(LEN, 14), &[b(FilterType::TiltShelf, 1000.0, 9.0, FLAT_Q)])),
+            ("harsh", through(pink_noise(LEN, 13), &[b(FilterType::Bell, 3000.0, 7.0, 1.0)])),
+            ("broad hump", through(pink_noise(LEN, 15), &[b(FilterType::Bell, 500.0, 6.0, 0.4)])),
+            (
+                "two humps",
+                through(pink_noise(LEN, 16), &[b(FilterType::Bell, 200.0, 6.0, 1.5), b(FilterType::Bell, 700.0, 6.0, 1.5)]),
+            ),
+            (
+                "mix",
+                through(
+                    pink_noise(LEN, 17),
+                    &[
+                        b(FilterType::LowShelf, 150.0, 6.0, FLAT_Q),
+                        b(FilterType::Bell, 2500.0, 5.0, 0.7),
+                        b(FilterType::HighShelf, 8000.0, -6.0, FLAT_Q),
+                    ],
+                ),
+            ),
+            (
+                // Heavy bass, dull top and several mid bumps, like much
+                // produced music measured against pink.
+                "music",
+                through(
+                    pink_noise(LEN, 18),
+                    &[
+                        b(FilterType::LowShelf, 120.0, 10.0, FLAT_Q),
+                        b(FilterType::Bell, 250.0, 4.0, 1.0),
+                        b(FilterType::Bell, 1200.0, 3.0, 2.0),
+                        b(FilterType::Bell, 3500.0, 4.0, 1.5),
+                        b(FilterType::HighShelf, 6000.0, -10.0, FLAT_Q),
+                    ],
+                ),
+            ),
+            (
+                "boomy mids",
+                through(
+                    pink_noise(LEN, 19),
+                    &[b(FilterType::Bell, 150.0, 9.0, 0.8), b(FilterType::Bell, 400.0, 7.0, 0.9), b(FilterType::Bell, 900.0, 5.0, 1.2)],
+                ),
+            ),
+        ]
+    }
+
+    /// Summed response of `bands` minus the wanted cut (-excess) at each
+    /// point: > 0 where they cut too little, < 0 where they cut too much.
+    fn misfit(freqs: &[f64], excess: &[f64], bands: &[Band]) -> Vec<f64> {
+        let designs: Vec<Design> = bands.iter().map(|b| design(b, SR as f64)).collect();
+        freqs
+            .iter()
+            .zip(excess)
+            .map(|(&f, e)| designs.iter().map(|d| d.response_db(f, SR as f64)).sum::<f64>() + e)
+            .collect()
+    }
+
+    /// How well the balance bands add up to the excess, for tuning:
+    /// `cargo test --lib print_balance_fit -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_balance_fit() {
+        for (name, x) in coloured() {
+            let (freqs, excess) = balance_excess(&x, SR, &[]).unwrap();
+            let bands = fit_balance(&freqs, &excess, SR as f64);
+            let m = misfit(&freqs, &excess, &bands);
+            let over = m.iter().fold(0.0f64, |a, v| a.min(*v));
+            let under = m.iter().fold(0.0f64, |a, v| a.max(*v));
+            let rms = (m.iter().map(|v| v * v).sum::<f64>() / m.len() as f64).sqrt();
+            eprintln!("{name}: overcut {over:.2} dB, undercut {under:.2} dB, rms {rms:.2} dB, max excess {:.2}", excess.iter().fold(0.0f64, |a, v| a.max(*v)));
+            for band in &bands {
+                eprintln!("    {:?} {:.0} Hz {:.2} dB Q {:.2}", band.kind, band.freq, band.gain, band.q);
+            }
+            for (i, f) in freqs.iter().enumerate().step_by(4) {
+                eprintln!("    {:>6.0} Hz  want {:>6.2}  got {:>6.2}", f, -excess[i], m[i] - excess[i]);
+            }
+        }
+    }
+
     #[test]
     fn steady_tones_are_found_and_cut_narrowly() {
         let mut x = pink_noise(LEN, 3);
@@ -649,6 +918,22 @@ mod tests {
         // With the boost already undone by another band nothing is left to do.
         let undo = Band { gain: -8.0, ..boost };
         assert!(balance(&x, SR, &[undo]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn balance_bands_add_up_to_the_excess() {
+        for (name, x) in coloured() {
+            let (freqs, excess) = balance_excess(&x, SR, &[]).unwrap();
+            let bands = balance(&x, SR, &[]).unwrap();
+            assert_eq!(bands.len(), fit_balance(&freqs, &excess, SR as f64).len());
+            let m = misfit(&freqs, &excess, &bands);
+            let over = m.iter().fold(0.0f64, |a, v| a.min(*v));
+            let rms = (m.iter().map(|v| v * v).sum::<f64>() / m.len() as f64).sqrt();
+            // Overlapping bands share the cut: nowhere much deeper than wanted.
+            assert!(over > -1.25, "{name}: overcut {over:.2} dB {bands:?}");
+            assert!(rms < 0.75, "{name}: rms {rms:.2} dB {bands:?}");
+            assert!(bands.iter().all(|b| b.gain <= -MIN_BALANCE_CUT && b.gain >= -6.0), "{name}: {bands:?}");
+        }
     }
 
     #[test]
