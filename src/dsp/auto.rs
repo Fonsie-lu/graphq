@@ -429,6 +429,59 @@ pub fn balance(samples: &[f32], sample_rate: f32, others: &[Band]) -> Result<Vec
     Ok(bands)
 }
 
+/// Where the bands of an analysis go (see [`plan`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Plan {
+    /// Band index and the values to write (the band is switched on).
+    pub writes: Vec<(usize, Band)>,
+    /// Bands the feature made before that are no longer needed: switch off.
+    pub off: Vec<usize>,
+    /// Owner tags of all bands afterwards.
+    pub owners: Vec<u8>,
+}
+
+/// Assigns `bands` from a `feature` run to band slots: first the bands the
+/// feature made before (`owners[i]` is its tag), then bands that are off.
+/// Leftover bands of the feature are switched off; manual bands and the
+/// other feature's active bands are never touched. Bands that find no slot
+/// are dropped (`writes.len() < bands.len()`).
+pub fn plan(feature: Feature, on: &[bool], owners: &[u8], bands: &[Band]) -> Plan {
+    let tag = feature as u8;
+    let mut owners = owners.to_vec();
+    let mut slots: Vec<usize> = (0..owners.len()).filter(|&b| owners[b] == tag).collect();
+    slots.extend((0..owners.len()).filter(|&b| owners[b] != tag && !on[b]));
+    let placed = bands.len().min(slots.len());
+    let writes: Vec<(usize, Band)> = slots.iter().zip(bands).map(|(&b, band)| (b, Band { on: true, ..*band })).collect();
+    for &(b, _) in &writes {
+        owners[b] = tag;
+    }
+    let off: Vec<usize> = slots[placed..].iter().copied().filter(|&b| owners[b] == tag).collect();
+    for &b in &off {
+        owners[b] = 0;
+    }
+    Plan { writes, off, owners }
+}
+
+/// Status line for a finished run that placed `placed` of the bands found.
+pub fn status(feature: Feature, result: &Result<Vec<Band>, AutoError>, placed: usize) -> String {
+    let found = match result {
+        Ok(bands) => bands.len(),
+        Err(AutoError::NoSignal) => return "NO SIGNAL".to_owned(),
+        Err(AutoError::TooShort) => return "NO AUDIO RECEIVED".to_owned(),
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "S" };
+    let mut text = match (feature, found) {
+        (Feature::Resonances, 0) => "NO RESONANCES FOUND".to_owned(),
+        (Feature::Resonances, _) => format!("{placed} RESONANCE{} CUT", plural(placed)),
+        (Feature::Balance, 0) => "ALREADY BALANCED".to_owned(),
+        (Feature::Balance, _) => format!("BALANCED: {placed} CUT{}", plural(placed)),
+    };
+    if found > placed {
+        text = format!("{text}, {} NO FREE BAND", found - placed);
+    }
+    text
+}
+
 /// Runs `feature`'s analysis.
 pub fn analyze(feature: Feature, samples: &[f32], sample_rate: f32, others: &[Band]) -> Result<Vec<Band>, AutoError> {
     match feature {
@@ -487,6 +540,23 @@ mod tests {
         let (mut l, mut r) = (x.to_vec(), x.to_vec());
         eq.process(&mut l, &mut r);
         l
+    }
+
+    #[test]
+    fn plan_reuses_own_bands_then_free_ones() {
+        let b = |f: f32| Band { on: true, freq: f, gain: -3.0, ..Band::default() };
+        // 0: manual on, 1: old resonance, 2: free, 3: balance on, 4: old resonance, 5: free.
+        let on = [true, true, false, true, true, false];
+        let owners = [0, 1, 0, 2, 1, 0];
+        let p = plan(Feature::Resonances, &on, &owners, &[b(100.0)]);
+        assert_eq!(p.writes.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(p.off, vec![4]);
+        assert_eq!(p.owners, vec![0, 1, 0, 2, 0, 0]);
+        let p = plan(Feature::Resonances, &on, &owners, &[b(1.0), b(2.0), b(3.0), b(4.0), b(5.0)]);
+        assert_eq!(p.writes.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 4, 2, 5]);
+        assert!(p.off.is_empty());
+        assert_eq!(status(Feature::Resonances, &Ok(vec![b(1.0); 5]), p.writes.len()), "4 RESONANCES CUT, 1 NO FREE BAND");
+        assert_eq!(status(Feature::Balance, &Ok(vec![]), 0), "ALREADY BALANCED");
     }
 
     #[test]

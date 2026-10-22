@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-GraphQ (vendor Fonsie Audio) is a graphical 16-band parametric EQ plugin with an automatic EQ (resonance removal, pink noise balance) from a 10 s capture, CLAP + VST3, built on nih-plug with a custom-painted nih_plug_egui editor (egui 0.31). It follows the sibling project `~/tools/double-slit` in structure, build, install script and GUI style (same four themes, fonts, `Cv`/`G` painting helpers, headless editor tests). It is meant to be hosted by RasDaw (`~/tools/daw`) and other CLAP/VST3 hosts.
+GraphQ (vendor Fonsie Audio) is a graphical 16-band parametric EQ plugin with an automatic EQ (resonance removal, pink noise balance) from a 10 s capture, CLAP + VST3, built on nih-plug with a custom-painted nih_plug_egui editor (egui 0.31). It follows the sibling project `~/tools/double-slit` in structure, build, install script and GUI style (same four themes, fonts, `Cv`/`G` painting helpers, headless editor tests). It is meant to be hosted by RasDaw (`~/tools/daw`) and other CLAP/VST3 hosts. RasDaw also embeds the DSP directly as its built-in device `rasdaw.graphq` (path dependency, `default-features = false`): keep `src/dsp/` free of nih-plug and run `cargo test --no-default-features --lib` after changing its public API, then `cargo test` in `~/tools/daw`.
 
 ## Commands
 
@@ -27,7 +27,7 @@ Screenshot workflow: start the preview with `timeout 9 ... &`, wait ~6 s, `impor
 
 ## Architecture
 
-Two layers with a hard boundary:
+Two layers with a hard boundary. The `plugin` cargo feature (default) gates `plugin.rs` (the nih-plug `Plugin`, CLAP/VST3 exports), `params` and `editor`; `gui_preview` and `tests/no_alloc.rs` require it.
 
 - **`src/dsp/`**: filters, the EQ processor, analyser maths and shared state. **No nih-plug or egui imports.**
   - `filter.rs`: `Band` (natural units), `FilterType`/`Slope`/`Placement` with their display names, `design()` (RBJ biquads; cuts as Butterworth cascades, the most resonant pole pair scaled by Q/0.71) and `Design::response_db()`, the exact digital response the graph draws.
@@ -35,7 +35,7 @@ Two layers with a hard boundary:
   - `shared.rs`: `Shared` (one `Arc`): pre/post analyser rings (atomics, 8192 samples), sample rate, output peaks (only while the editor is open), the auto EQ capture slot, `job` and `result`. The audio thread only stores; the mutexes are for the GUI and analysis threads.
   - `auto.rs`: automatic EQ. `Capture` (10 s mono, atomics; the audio thread appends via `Shared::push_capture`, an `AtomicPtr` into an `Arc` that `Shared::captures` keeps alive for its whole life, reused per sample rate, so the audio thread never frees). `find_resonances` (Welch average, ~3 Hz bins; median baseline ±1/3 oct; prominence ≥ 6 dB, -3 dB width Q ≥ 3, sticks out by 3 dB in ≥ 50 % of frames; bell down to the baseline) and `balance` (1/3-octave levels every 1/12 oct tilted +3 dB/oct so pink is flat; excess over the median of 40 Hz–12 kHz; greedy bells/shelves, ≤ 6 dB each, until the excess is < 1.5 dB). Both add the response of the bands they do not own (`others`) and return only cuts. `pink_noise` (Kellet) feeds the tests and the preview demo.
   - `spectrum.rs`: FFT (`fft.rs`, copied from Double Slit) of the ring, sampled at the graph's log-spaced points (max of the bins per point, interpolation where points are denser than bins), +4.5 dB/oct display tilt, rise/fall smoothing.
-- **`src/lib.rs`, `src/params.rs`, `src/editor/`**: the plugin, host parameters and GUI. `process` reads all parameters once per block (`GraphqParams::bands()`), feeds the capture (input, before the EQ), calls `Eq::set_params`, then `Eq::process`; nih-plug smoothers are not used.
+- **`src/plugin.rs`, `src/params.rs`, `src/editor/`**: the plugin, host parameters and GUI. `process` reads all parameters once per block (`GraphqParams::bands()`), feeds the capture (input, before the EQ), calls `Eq::set_params`, then `Eq::process`; nih-plug smoothers are not used.
 
 ### Parameters
 
@@ -49,7 +49,7 @@ Painted on a fixed 1200×640 canvas (`BW`/`BH`) through `Cv`, scaled to the wind
 - Knob travel is logarithmic for frequency and Q (`Pid::log_travel`), independent of the host's skewed range.
 - Graph mapping: `x_of`/`freq_at` (log, 10 Hz – 30 kHz), `y_of`/`db_at` at the selected range. Nodes of types without gain sit on the 0 dB line and drag horizontally only.
 - Never hard-code colours; add a `Theme` field (`theme.rs`) and fill it for all four themes. `Theme::band(b)` gives band colours (eight, repeating).
-- Auto EQ flow (`auto_section`): a button click calls `Shared::start_capture` and sets `job.running` (new `job.run` id); each frame checks the capture; when full it detaches it and `start_analysis` spawns a thread with the samples and the other bands; `apply_result` takes `Shared::result` (only for the current run id) and `apply_auto` writes the bands into the feature's own bands first, then into switched-off bands, switches off leftover own bands and updates the owner tags. One run at a time; clicking the running button cancels. The state lives in `Shared`, so a run survives closing the editor, but its bands are applied only once the editor is open again.
+- Auto EQ flow, shared with RasDaw: `Shared::begin_run` / `cancel_run`; `poll_run` every frame (when the capture is full it starts the analysis thread with the bands the feature does not own; returns the result once, only for the current run id); the caller applies it with `auto::plan` (the feature's own bands first, then switched-off ones; leftover own bands off; new owner tags) and calls `finish_run(auto::status(..))`; `run_state` for drawing. The editor does this in `auto_section`/`apply_auto`. One run at a time; clicking the running button cancels. The state lives in `Shared`, so a run survives closing the editor, but its bands are applied only once the editor is open again.
 - `src/editor_tests.rs` (compiled as `editor::tests` via `#[path]`) runs the real editor headless against a mock host that applies values late and checks gesture balance. Controls register their rects in `EditorState::controls` under the parameter ID (cells as `"<id>#<i>"`, nodes as `node_<n>`, chips as `band:<n>`, `theme:<NAME>`, `analyzer:<MODE>`, `range:<dB>`, popup entries as `popup:<i>`, `auto:resonances`, `auto:balance`). `Harness::feed` plays a signal into the capture and waits for the analysis thread. Clicks in the harness are spaced 1 s apart: egui counts a triple click within twice the double-click delay.
 
 ## Conventions

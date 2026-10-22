@@ -30,8 +30,11 @@ pub struct Shared {
     /// GUI thread only; here so it survives closing the editor).
     pub job: Mutex<AutoJob>,
     /// Bands from the analysis thread, tagged with the run they belong to.
-    pub result: Mutex<Option<(u64, Result<Vec<Band>, AutoError>)>>,
+    pub result: Mutex<Option<(u64, AutoResult)>>,
 }
+
+/// What an automatic EQ analysis returns.
+pub type AutoResult = Result<Vec<Band>, AutoError>;
 
 #[derive(Clone, Debug, Default)]
 pub struct AutoJob {
@@ -106,6 +109,78 @@ impl Shared {
     pub fn active_capture(&self) -> Option<Arc<Capture>> {
         let p = self.capture.load(Ordering::Acquire);
         self.captures.lock().unwrap().iter().find(|c| std::ptr::eq(Arc::as_ptr(c), p)).cloned()
+    }
+
+    /// Starts an automatic EQ run: records the next 10 s of input (GUI thread).
+    pub fn begin_run(&self, feature: Feature) {
+        self.start_capture(self.sample_rate.load(RELAXED));
+        let mut job = self.job.lock().unwrap();
+        job.running = Some(feature);
+        job.run += 1;
+        job.analyzing = false;
+        job.status.clear();
+    }
+
+    pub fn cancel_run(&self) {
+        self.stop_capture();
+        let mut job = self.job.lock().unwrap();
+        job.running = None;
+        job.analyzing = false;
+        job.status = "CANCELLED".to_owned();
+    }
+
+    /// Advances a run; call every frame from the GUI thread. When the capture
+    /// is full, the analysis starts on its own thread with the bands
+    /// `others(feature)` returns (the active bands the feature does not own).
+    /// When it is done, the result is returned once; apply it, then call
+    /// [`Shared::finish_run`].
+    pub fn poll_run(
+        self: &Arc<Self>,
+        others: impl FnOnce(Feature) -> Vec<Band>,
+    ) -> Option<(Feature, AutoResult)> {
+        let (feature, run, analyzing) = {
+            let job = self.job.lock().unwrap();
+            (job.running?, job.run, job.analyzing)
+        };
+        if analyzing {
+            let result = self.result.lock().unwrap().take();
+            return result.filter(|(r, _)| *r == run).map(|(_, result)| (feature, result));
+        }
+        match self.active_capture() {
+            Some(c) if c.is_full() => {
+                self.stop_capture();
+                self.job.lock().unwrap().analyzing = true;
+                let (samples, sample_rate) = (c.samples(), c.sample_rate);
+                let others = others(feature);
+                let shared = self.clone();
+                std::thread::spawn(move || {
+                    let result = super::auto::analyze(feature, &samples, sample_rate, &others);
+                    *shared.result.lock().unwrap() = Some((run, result));
+                });
+            }
+            Some(_) => {}
+            None => self.job.lock().unwrap().running = None,
+        }
+        None
+    }
+
+    /// Ends the run whose result was applied, with its status line.
+    pub fn finish_run(&self, status: String) {
+        let mut job = self.job.lock().unwrap();
+        job.running = None;
+        job.analyzing = false;
+        job.status = status;
+    }
+
+    /// What to show for the run: the feature, the recorded share (None while
+    /// analysing) and the last status line.
+    pub fn run_state(&self) -> (Option<Feature>, Option<f32>, String) {
+        let job = self.job.lock().unwrap().clone();
+        let progress = match job.running {
+            Some(_) if !job.analyzing => self.active_capture().map(|c| c.progress()),
+            _ => None,
+        };
+        (job.running, progress, job.status)
     }
 
     /// Returns and clears the held peaks (editor).

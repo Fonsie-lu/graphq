@@ -12,11 +12,17 @@ members = ["xtask"]
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+default = ["plugin"]
+# The CLAP/VST3 plugin and its editor. Without it the crate is only `dsp`, for
+# hosts that embed the EQ (RasDaw: `default-features = false`).
+plugin = ["dep:nih_plug", "dep:nih_plug_egui"]
+
 [dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23", features = [
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23", optional = true, features = [
     "assert_process_allocs",
 ] }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23", optional = true }
 atomic_float = "0.1"
 
 # Only for `examples/gui_preview.rs`, which opens the editor in a plain window
@@ -25,6 +31,14 @@ atomic_float = "0.1"
 assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid" }
 baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "9a0b42c09d712777b2edb4c5e0cb6baf21e988f0" }
 egui-baseview = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "ec70c3fe6b2f070dcacbc22924431edbe24bd1c0", features = ["opengl"] }
+
+[[example]]
+name = "gui_preview"
+required-features = ["plugin"]
+
+[[test]]
+name = "no_alloc"
+required-features = ["plugin"]
 
 [profile.release]
 lto = "fat"

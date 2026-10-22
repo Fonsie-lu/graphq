@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
-use crate::dsp::auto::{self, AutoError, Feature, CAPTURE_SECONDS};
+use crate::dsp::auto::{self, Feature, CAPTURE_SECONDS};
 use crate::dsp::eq::NUM_BANDS;
 use crate::dsp::filter::{Band, FilterType, Placement, Slope, FLAT_Q};
 use crate::dsp::shared::Shared;
@@ -373,27 +373,22 @@ impl G<'_, '_> {
     fn auto_section(&mut self) {
         let cv = self.cv;
         let shared = self.st.shared.clone();
-        let mut job = shared.job.lock().unwrap().clone();
-        if let Some(feature) = job.running {
-            if job.analyzing {
-                let result = shared.result.lock().unwrap().take();
-                if let Some((_, result)) = result.filter(|(run, _)| *run == job.run) {
-                    job.status = self.apply_result(feature, result);
-                    job.running = None;
-                    job.analyzing = false;
-                }
-            } else {
-                match shared.active_capture() {
-                    Some(c) if c.is_full() => {
-                        shared.stop_capture();
-                        job.analyzing = true;
-                        self.start_analysis(feature, job.run, c.samples(), c.sample_rate);
-                    }
-                    Some(_) => {}
-                    None => job.running = None,
-                }
-            }
+        let finished = shared.poll_run(|feature| {
+            let owners = self.p.owners();
+            (0..NUM_BANDS)
+                .filter(|&b| owners[b] != feature as u8)
+                .map(|b| self.band(b))
+                .filter(|b| b.on)
+                .collect()
+        });
+        if let Some((feature, result)) = finished {
+            let placed = match &result {
+                Ok(bands) => self.apply_auto(feature, bands),
+                Err(_) => 0,
+            };
+            shared.finish_run(auto::status(feature, &result, placed));
         }
+        let (running, progress, status) = shared.run_state();
 
         let x = AUTO_X + 10.0;
         let w = BW_AUTO - 20.0;
@@ -401,20 +396,14 @@ impl G<'_, '_> {
             (Feature::Resonances, "auto:resonances", "1  RESONANCES", 512.0),
             (Feature::Balance, "auto:balance", "2  BALANCE (MASTER)", 546.0),
         ] {
-            let active = job.running == Some(feature);
-            let enabled = job.running.is_none() || active;
+            let active = running == Some(feature);
+            let enabled = running.is_none() || active;
             let color = self.feature_color(feature);
             if self.button(key, x, y, w, 26.0, label, active, color, enabled) {
                 if active {
-                    shared.stop_capture();
-                    job.running = None;
-                    job.analyzing = false;
-                    job.status = "CANCELLED".to_owned();
+                    shared.cancel_run();
                 } else {
-                    shared.start_capture(shared.sample_rate.load(Relaxed));
-                    job.running = Some(feature);
-                    job.run += 1;
-                    job.status.clear();
+                    shared.begin_run(feature);
                 }
             }
             self.pt.circle_filled(cv.p(x + 10.0, y + 13.0), 3.0 * cv.s, if enabled { color } else { self.th.legend });
@@ -422,73 +411,25 @@ impl G<'_, '_> {
 
         let bar = cv.r(x, 582.0, w, 6.0);
         self.pt.rect_filled(bar, cv.round(2.0), self.th.slot);
-        let (status, color) = match (job.running, shared.active_capture()) {
-            (Some(f), _) if job.analyzing => ("ANALYZING".to_owned(), self.feature_color(f)),
-            (Some(f), Some(c)) => {
-                let p = c.progress();
+        let (status, color) = match (running, progress) {
+            (Some(f), None) => ("ANALYZING".to_owned(), self.feature_color(f)),
+            (Some(f), Some(p)) => {
                 let fill = Rect::from_min_size(bar.min, vec2(bar.width() * p, bar.height()));
                 self.pt.rect_filled(fill, cv.round(2.0), self.feature_color(f));
                 (format!("RECORDING  {:.1} / {CAPTURE_SECONDS:.0} s", p * CAPTURE_SECONDS), self.feature_color(f))
             }
-            _ => (job.status.clone(), self.th.text),
+            _ => (status, self.th.text),
         };
         self.text(cv.p(x + w * 0.5, 602.0), Align2::CENTER_CENTER, &status, 9.0, color);
         self.text(cv.p(x + w * 0.5, 620.0), Align2::CENTER_CENTER, "1 THEN 2 · CUTS ONLY", 9.0, self.th.legend);
-        *shared.job.lock().unwrap() = job;
     }
 
-    /// Analyses a finished capture on a background thread; the result comes
-    /// back through `Shared::result`. The analysis sees the signal through
-    /// every band the feature did not make itself.
-    fn start_analysis(&mut self, feature: Feature, run: u64, samples: Vec<f32>, sample_rate: f32) {
-        let owners = self.p.owners();
-        let others: Vec<Band> = (0..NUM_BANDS)
-            .filter(|&b| owners[b] != feature as u8)
-            .map(|b| self.band(b))
-            .filter(|b| b.on)
-            .collect();
-        let shared = self.st.shared.clone();
-        std::thread::spawn(move || {
-            let result = auto::analyze(feature, &samples, sample_rate, &others);
-            *shared.result.lock().unwrap() = Some((run, result));
-        });
-    }
-
-    /// Applies an analysis result; returns the status line.
-    pub(crate) fn apply_result(&mut self, feature: Feature, result: Result<Vec<Band>, AutoError>) -> String {
-        let bands = match result {
-            Ok(bands) => bands,
-            Err(AutoError::NoSignal) => return "NO SIGNAL".to_owned(),
-            Err(AutoError::TooShort) => return "NO AUDIO RECEIVED".to_owned(),
-        };
-        let placed = self.apply_auto(feature, &bands);
-        let missing = bands.len() - placed;
-        let mut text = match (feature, placed) {
-            (Feature::Resonances, 0) if missing == 0 => "NO RESONANCES FOUND".to_owned(),
-            (Feature::Resonances, n) => format!("{n} RESONANCE{} CUT", if n == 1 { "" } else { "S" }),
-            (Feature::Balance, 0) if missing == 0 => "ALREADY BALANCED".to_owned(),
-            (Feature::Balance, n) => format!("BALANCED: {n} CUT{}", if n == 1 { "" } else { "S" }),
-        };
-        if missing > 0 {
-            text = format!("{text}, {missing} NO FREE BAND");
-        }
-        text
-    }
-
-    /// Writes `bands` into the bands `feature` made before, then into free
-    /// (off) bands; switches off what is left of the old ones. Returns how
-    /// many bands were placed.
+    /// Writes the bands of a finished run as [`auto::plan`] assigns them.
+    /// Returns how many bands were placed.
     pub(crate) fn apply_auto(&mut self, feature: Feature, bands: &[Band]) -> usize {
-        let tag = feature as u8;
-        let mut owners = self.p.owners();
-        let mut slots: Vec<usize> = (0..NUM_BANDS).filter(|&b| owners[b] == tag).collect();
-        for (b, &owner) in owners.iter().enumerate() {
-            if owner != tag && self.plain(Pid::Band(b, Field::On)) < 0.5 {
-                slots.push(b);
-            }
-        }
-        let placed = bands.len().min(slots.len());
-        for (band, &b) in bands.iter().zip(&slots) {
+        let on: Vec<bool> = (0..NUM_BANDS).map(|b| self.plain(Pid::Band(b, Field::On)) > 0.5).collect();
+        let plan = auto::plan(feature, &on, &self.p.owners(), bands);
+        for &(b, band) in &plan.writes {
             self.change(Pid::Band(b, Field::Kind), band.kind as i32 as f32);
             self.change(Pid::Band(b, Field::Freq), band.freq);
             self.change(Pid::Band(b, Field::Gain), band.gain);
@@ -496,16 +437,12 @@ impl G<'_, '_> {
             self.change(Pid::Band(b, Field::Slope), band.slope as i32 as f32);
             self.change(Pid::Band(b, Field::Place), band.place as i32 as f32);
             self.change(Pid::Band(b, Field::On), 1.0);
-            owners[b] = tag;
         }
-        for &b in &slots[placed..] {
-            if owners[b] == tag {
-                self.change(Pid::Band(b, Field::On), 0.0);
-                owners[b] = 0;
-            }
+        for &b in &plan.off {
+            self.change(Pid::Band(b, Field::On), 0.0);
         }
-        self.p.set_owners(owners);
-        placed
+        self.p.set_owners(std::array::from_fn(|b| plan.owners[b]));
+        plan.writes.len()
     }
 
     /// Picks a sensible Q when the type changes and Q is still at the other

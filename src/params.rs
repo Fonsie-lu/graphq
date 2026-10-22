@@ -8,16 +8,11 @@ use nih_plug_egui::EguiState;
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
 
-use crate::dsp::eq::NUM_BANDS;
+use crate::dsp::eq::{DEFAULT_FREQS, NUM_BANDS};
 use crate::dsp::filter::{
     Band, FilterType, Placement, Slope, MAX_FREQ, MAX_GAIN, MAX_Q, MIN_FREQ, MIN_Q,
 };
 
-/// Default frequencies of the (initially off) bands.
-pub const DEFAULT_FREQS: [f32; NUM_BANDS] = [
-    30.0, 45.0, 70.0, 100.0, 150.0, 220.0, 330.0, 500.0, 750.0, 1100.0, 1700.0, 2500.0, 3700.0, 5500.0, 8200.0,
-    12000.0,
-];
 pub const MAX_OUTPUT: f32 = 24.0;
 
 /// One parameter of a band, for the editor's generic parameter I/O.

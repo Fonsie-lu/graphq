@@ -10,6 +10,11 @@
 use super::filter::{design, Band, Design, FilterType, Placement, Slope, MAX_SECTIONS};
 
 pub const NUM_BANDS: usize = 16;
+/// Frequencies the (initially off) bands start at.
+pub const DEFAULT_FREQS: [f32; NUM_BANDS] = [
+    30.0, 45.0, 70.0, 100.0, 150.0, 220.0, 330.0, 500.0, 750.0, 1100.0, 1700.0, 2500.0, 3700.0, 5500.0, 8200.0,
+    12000.0,
+];
 /// Coefficient update interval in samples.
 pub const CHUNK: usize = 16;
 const GLIDE_SECONDS: f64 = 0.02;
